@@ -1,0 +1,1 @@
+Run main_GaitNet.py to train and test Gait-CNN model in subject-specific way
