@@ -1,1 +1,1 @@
-Run main_GaitNet.py to train and test Gait-CNN model in subject-specific way
+Run main_EEG2GAIT.py to train and test EEG2GAIT model in subject-specific way
