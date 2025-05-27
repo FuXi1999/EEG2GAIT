@@ -121,10 +121,7 @@ def run(time_step):
 
         for trial in range(2, 3):
             
-            if model_name == 'GaitNet_woSAB':
-                model = GaitNet_noAT(config).to(device)
-            elif model_name == 'GaitNet':
-                model = GaitNet(config).to(device)
+            model = EEG2GAIT(config).to(device)
                 
 
             if (count_flag == 0):
