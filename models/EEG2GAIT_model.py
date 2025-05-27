@@ -1,114 +1,175 @@
 import torch
 import torch.nn as nn
-
-from utils.myaml import load_config
-import torch.nn.functional as F
-import time
-import math
+from torchvision.ops import DeformConv2d
 
 
-
-class EEG2GAIT(nn.Module):
-    """
-    test version.  ///v///
-    """
+class EEG2Gait(nn.Module):
 
     def __init__(self, config):
-        super(EEG2GAIT, self).__init__()
-        self.ts = config.eegnet.eeg.time_step
-        self.config = config.eegnet
-        self.drop_out = self.config.dropout
-        self.block_1 = nn.Sequential(
-            nn.ZeroPad2d((self.config.blk1_kernel//2-1, self.config.blk1_kernel//2, 0, 0)),
-            nn.Conv2d(
-                in_channels=1,  # input shape (1, C, T)
-                out_channels=self.config.F1,  # num_filters
-                kernel_size=(1, self.config.blk1_kernel),  # filter size
-                bias=False
-            ),  # output shape (8, C, T)
-            nn.BatchNorm2d(self.config.F1)  # output shape (8, C, T)
+        super().__init__()
+        nChan = config.num_chan_eeg
+        nTime = config.eegnet.eeg.time_step
+        pool_width = 3
+        poolSize = {
+                "LocalLayers": [(1, pool_width), (1, pool_width), (1, pool_width)],
+                "GlobalLayers": (1, pool_width),
+            }
+        kernel_width = 10
+        self.kernel_width = kernel_width
+        localKernalSize = {
+                "LocalLayers": [(1, kernel_width), (1, kernel_width), (1, kernel_width)],
+                "GlobalLayers": (1, kernel_width),
+            }
+        nClass = config.eegnet.num_chan_kin
+        dropoutP = 0.5
+        nFilt_FirstLayer = 25
+        nFiltLaterLayer = [25, 50, 100, 200]
+
+        self.firstLayer = self.firstBlock(
+            nFilt_FirstLayer,
+            dropoutP,
+            localKernalSize["LocalLayers"][0],
+            nChan,
+            poolSize["LocalLayers"][0],
         )
-
-       
-        self.block_2 = nn.Sequential(
-
-            nn.Conv2d(
-                in_channels=self.config.F1,  # input shape (8, C, T)
-                out_channels=self.config.D * self.config.F1,  # num_filters
-                kernel_size=(self.config.num_chan_eeg, 1),  # filter size
-                groups=self.config.F1,
-                bias=False
-            ),  # output shape (16, 1, T)
-            nn.BatchNorm2d(self.config.D * self.config.F1),  # output shape (16, 1, T)
-            nn.ELU(),
-            nn.AvgPool2d((1, 4)),  # output shape (16, 1, T//4)
-            nn.Dropout(self.drop_out)  # output shape (16, 1, T//4)
+        # middleLayers = nn.Sequential(*[self.convBlock(inF, outF, dropoutP, localKernalSize)
+        #     for inF, outF in zip(nFiltLaterLayer[:-1], nFiltLaterLayer[1:-1])])
+        self.middleLayers = nn.Sequential(
+            *[
+                self.convBlock(inF, outF, dropoutP, kernalS, poolS)
+                for inF, outF, kernalS, poolS in zip(
+                    nFiltLaterLayer[:-2],
+                    nFiltLaterLayer[1:-2],
+                    localKernalSize["LocalLayers"][1:],
+                    poolSize["LocalLayers"][1:],
+                )
+            ]
         )
-
-        self.temporal_atten = nn.MultiheadAttention(self.config.F2, self.config.F2)
+        self.deform_conv_width = localKernalSize["LocalLayers"][-3][1]
+        self.deform_conv = DeformConv2d(
+            in_channels=nFiltLaterLayer[-3],
+            out_channels=nFiltLaterLayer[-2],
+            kernel_size=(1, self.deform_conv_width),
+            padding=((self.deform_conv_width-1) // 2, self.deform_conv_width // 2)
+        )
         
-        self.mask = self.config.mask
-        self.block_5 = nn.Sequential(
-            nn.ZeroPad2d(((self.config.blk5_kernel + 1) // 2-1, (self.config.blk5_kernel + 1) // 2, 0, 0)),
-            nn.Conv2d(
-                in_channels=1,  # input shape (1, 32, T//4)
-                out_channels=self.config.F2 * 2,  # num_filters
-                kernel_size=(self.config.F2 * 2, self.config.blk5_kernel),  # filter size
-                bias=False
-            ),  # output shape (32, 1, T//4)
+        self.firstGlobalLayer = self.convBlock(
+            nFiltLaterLayer[-2],
+            nFiltLaterLayer[-1],
+            dropoutP,
+            localKernalSize["GlobalLayers"],
+            poolSize["GlobalLayers"],
+        )
 
-            nn.BatchNorm2d(self.config.F2 * 2),  # output shape (32, 1, T//4)
+        self.allButLastLayers = nn.Sequential(
+            self.firstLayer, self.middleLayers, self.firstGlobalLayer
+        )
+
+        self.lastLayer = self.lastBlock(nFiltLaterLayer[-1], nClass, (1, 2))
+
+        
+        self.weight_keys = [
+            [
+                "allButLastLayers.0.0.weight",
+                "allButLastLayers.0.0.bias",
+                "allButLastLayers.0.1.weight",
+            ],
+            ["allButLastLayers.1.0.1.weight"],
+            ["allButLastLayers.1.1.1.weight"],
+            ["allButLastLayers.2.1.weight"],
+            ["lastLayer.0.weight", "lastLayer.0.bias"],
+        ]
+
+        # 多尺度卷积分支
+        self.multi_scale_conv = nn.ModuleList([
+            nn.Sequential(
+                nn.ZeroPad2d(((ks-1) // 2, ks // 2, 0, 0)),
+                nn.Conv2d(1, 1, kernel_size=(1, ks)),
+                nn.ELU(),
+            )
+            for ks in [5, 10, 20]  # 短、中、长三个尺度
+        ])
+
+        # 相位门控机制
+        self.phase_gate = nn.Sequential(
+            nn.Conv2d(nFiltLaterLayer[-1], nFiltLaterLayer[-1], kernel_size=(1, 1)),
+            nn.Sigmoid()
+        )
+
+    def convBlock(self, inF, outF, dropoutP, kernalSize, poolSize, *args, **kwargs):
+        return nn.Sequential(
+            nn.Dropout(p=dropoutP),
+            nn.ZeroPad2d((kernalSize[1] // 2 - 1, kernalSize[1] // 2, 0, 0)),
+            Conv2dWithConstraint(
+                inF, outF, kernalSize, bias=False, max_norm=2, *args, **kwargs
+            ),
+            nn.BatchNorm2d(outF),
             nn.ELU(),
-            nn.AvgPool2d((1, 8)),# output shape (32, 1, T//32)
-            nn.Dropout(self.drop_out)
+            nn.MaxPool2d(poolSize, stride=poolSize),
         )
-        self.out = nn.Sequential(
-            nn.Conv2d(
-                in_channels=1,  # input shape (1, 32, T//4)
-                out_channels=self.config.num_chan_kin,  # num_filters
-                kernel_size=(self.config.F2 * 2, int((self.config.eeg.time_step - self.mask) / 32)),
-                bias=False
-            ),  # output shape (32, 1, T//4)
+
+    def firstBlock(self, outF, dropoutP, kernalSize, nChan, poolSize, *args, **kwargs):
+        return nn.Sequential(
+
+            nn.ZeroPad2d((kernalSize[1] // 2 - 1, kernalSize[1] // 2, 0, 0)),
+            Conv2dWithConstraint(
+                3, outF, kernalSize, padding=0, max_norm=2, *args, **kwargs
+            ),
+            Conv2dWithConstraint(25, 25, (nChan, 1), padding=0, bias=False, max_norm=2),
+            nn.BatchNorm2d(outF),
+            nn.ELU(),
+            nn.MaxPool2d(poolSize, stride=poolSize),
         )
-        self.flag = 0
+
+    def lastBlock(self, inF, outF, kernalSize, *args, **kwargs):
+        return nn.Sequential(
+
+            # nn.ZeroPad2d((kernalSize[1] // 2 - 1, kernalSize[1] // 2, 0, 0)),
+            Conv2dWithConstraint(inF, outF, kernalSize, max_norm=0.5, *args, **kwargs),
+            # nn.LogSoftmax(dim=1),
+        )
+
+    def calculateOutSize(self, model, nChan, nTime):
+        """
+        Calculate the output based on input size.
+        model is from nn.Module and inputSize is a array.
+        """
+        data = torch.rand(1, 1, nChan, nTime)
+        model.eval()
+        out = model(data).shape
+        return out[2:]
 
     def forward(self, x):
-        """
+        multi_scale_features = [conv(x) for conv in self.multi_scale_conv]
+        x = torch.cat(multi_scale_features, dim=1) 
 
-        Args:
-            x: (Batch_size, 1, C, Tap_size)
+        
+        x = self.firstLayer(x)
+        x = self.middleLayers(x)
+        offset = torch.zeros((x.size(0), 2 * self.deform_conv_width, x.size(2), x.size(3)))  
+        x = self.deform_conv(x, offset)
+        x = self.firstGlobalLayer(x)
 
-        Returns:
+        
+        phase_weight = self.phase_gate(x)
+        x = x * phase_weight  
 
-        """
-        if self.mask != 0:
-            x = x[:,:,:,:-1 * self.mask]
-        x = self.block_1(x)
-        self.out1 = x
-        self.out1.retain_grad()
-        x = self.block_2(x)  # output shape (16, 1, T//4)
-        x = torch.squeeze(x, 2)  # output shape (16, T//4)
-        tmp_x = x
-        x = x.permute(0, 2, 1)  # output shape (T//4, 16)
-        x_tempo, _ = self.temporal_atten(x, x, x)  # output shape (T//4, 16)
-        x_tempo = x_tempo.permute(0, 2, 1)  # output shape (F2, T//4)
-        x = torch.cat((tmp_x, x_tempo), dim=1)  # output shape (F2 * 2, T//4)
-        x = torch.unsqueeze(x, 1)# output shape (1, F2 * 2, T//4)
-        x = self.block_5(x)
-        self.feature = x
-        x = x.permute(0,2,1,3)
-        x = self.out(x)
-        x = x.squeeze()
+        x = self.lastLayer(x)
+        x = torch.squeeze(x, 3)
+        x = torch.squeeze(x, 2)
+
         return x
 
 
+class Conv2dWithConstraint(nn.Conv2d):
+    def __init__(self, *args, doWeightNorm=True, max_norm=1, **kwargs):
+        self.max_norm = max_norm
+        self.doWeightNorm = doWeightNorm
+        super().__init__(*args, **kwargs)
 
-
-if __name__ == "__main__":
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    x = torch.rand(100, 1, 59, 180).to(device)
-
-    config = load_config('../config.yaml')
-    model = EEG2GAIT(config).to(device)
-    out = model(x)
-    a = 0
+    def forward(self, x):
+        if self.doWeightNorm:
+            self.weight.data = torch.renorm(
+                self.weight.data, p=2, dim=0, maxnorm=self.max_norm
+            )
+        return super().forward(x)
